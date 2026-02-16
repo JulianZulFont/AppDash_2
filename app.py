@@ -22,73 +22,116 @@ DAYS_OPTIONS = [
     {"label": "30 días", "value": 30},
 ]
 
-# ---------- Texto (Descripción del dashboard) ----------
 DASHBOARD_DESC = """
-Dashboard para la clase número 4 del curso de Visualización y Storytelling de Datos
-
-Este dashboard fue desarrollado con Python utilizando la librería Dash con el objetivo de visualizar información
-financiera en tiempo casi real proveniente de la API pública de CoinGecko. La aplicación permite monitorear el
-comportamiento de distintas criptomonedas mediante una interfaz interactiva organizada en dos tableros principales.
-
-El primer tablero muestra el precio actual de una criptomoneda seleccionada por el usuario, el cual se actualiza
-automáticamente cada cierto intervalo de tiempo. Adicionalmente, se incluye un contador regresivo que indica cuándo
-se realizará la siguiente actualización, lo que permite observar la dinámica de los datos en tiempo real y entender
-el funcionamiento de sistemas basados en consultas periódicas a servicios externos.
-
-El segundo tablero presenta el comportamiento histórico del precio de la criptomoneda seleccionada, permitiendo
-visualizar su evolución en diferentes ventanas temporales. Esta visualización facilita el análisis de tendencias,
-variaciones y patrones en los precios, lo cual es fundamental en aplicaciones de análisis financiero y toma de
-decisiones basada en datos.
-
-Desde el punto de vista técnico, el proyecto integra consultas HTTP a una API externa, procesamiento de datos en
-formato JSON y actualización dinámica de componentes mediante callbacks reactivos. El desarrollo de este dashboard
-permitió comprender la arquitectura de aplicaciones interactivas basadas en datos, el manejo de información en tiempo
-real y la integración de servicios externos dentro de aplicaciones analíticas.
+Este dashboard fue desarrollado con Python utilizando Dash para visualizar información financiera en tiempo casi real
+desde la API pública de CoinGecko. En el primer tablero se muestra el precio actual de una criptomoneda seleccionada,
+con actualización automática y un contador regresivo. En el segundo tablero se presenta el histórico del precio para
+analizar tendencias en distintas ventanas de tiempo. Técnicamente, el proyecto integra consumo de APIs externas,
+procesamiento de JSON y actualización reactiva de componentes mediante callbacks.
 """
 
-# ---------- CoinGecko API ----------
+# ---------- CoinGecko API (con User-Agent + error visible) ----------
+HEADERS = {
+    "Accept": "application/json",
+    "User-Agent": "dash-coingecko-demo/1.0"
+}
+
 def obtener_precio_crypto(coin_id):
     url = "https://api.coingecko.com/api/v3/simple/price"
     params = {"ids": coin_id, "vs_currencies": "usd"}
 
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        return float(data[coin_id]["usd"])
-    except:
-        return None
+    r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+    # Si CoinGecko devuelve 403/429, lo mostramos
+    if r.status_code != 200:
+        return None, f"CoinGecko HTTP {r.status_code}: {r.text[:200]}"
 
+    data = r.json()
+    try:
+        return float(data[coin_id]["usd"]), ""
+    except Exception:
+        return None, "Respuesta JSON inesperada"
 
 def obtener_historico(coin_id, days):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
     params = {"vs_currency": "usd", "days": days}
 
-    try:
-        r = requests.get(url, params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+    r = requests.get(url, params=params, headers=HEADERS, timeout=25)
+    if r.status_code != 200:
+        return None, f"CoinGecko HTTP {r.status_code}: {r.text[:200]}"
 
-        prices = data.get("prices", [])
+    data = r.json()
+    prices = data.get("prices", [])
+    if not prices:
+        return None, "Sin datos en 'prices'"
 
-        xs = [datetime.fromtimestamp(p[0] / 1000, tz=timezone.utc) for p in prices]
-        ys = [float(p[1]) for p in prices]
-
-        return xs, ys
-    except:
-        return None
-
+    xs = [datetime.fromtimestamp(p[0] / 1000, tz=timezone.utc) for p in prices]
+    ys = [float(p[1]) for p in prices]
+    return (xs, ys), ""
 
 # ---------- Dash ----------
-app = Dash(__name__, suppress_callback_exceptions=True)
-server = app.server
+app = Dash(__name__)
+server = app.server  # para Render + gunicorn
+
+tab1_layout = html.Div([
+    html.H3("Precio actual (USD)"),
+
+    dcc.Dropdown(
+        id="coin-dropdown",
+        options=COINS,
+        value="bitcoin",
+        clearable=False,
+        style={"width": "300px"}
+    ),
+
+    html.H2(id="precio", style={"marginTop": "12px"}),
+
+    html.Div("Siguiente actualización en:"),
+    html.H2(id="countdown", style={"marginTop": "6px"}),
+
+    html.Pre(id="error-precio", style={"color": "crimson", "whiteSpace": "pre-wrap"}),
+
+    # Intervalos SIEMPRE presentes (no dinámicos)
+    dcc.Interval(id="tick-1s", interval=1000, n_intervals=0),
+    dcc.Interval(id="tick-60s", interval=REFRESH_SECONDS * 1000, n_intervals=0),
+])
+
+tab2_layout = html.Div([
+    html.H3("Histórico de precio"),
+
+    html.Div([
+        html.Div([
+            html.Label("Moneda"),
+            dcc.Dropdown(
+                id="coin-hist",
+                options=COINS,
+                value="bitcoin",
+                clearable=False,
+                style={"width": "250px"}
+            ),
+        ]),
+        html.Div([
+            html.Label("Periodo"),
+            dcc.Dropdown(
+                id="days",
+                options=DAYS_OPTIONS,
+                value=7,
+                clearable=False,
+                style={"width": "150px"}
+            ),
+        ]),
+    ], style={"display": "flex", "gap": "20px"}),
+
+    dcc.Graph(id="hist-graph"),
+    html.Pre(id="error-hist", style={"color": "crimson", "whiteSpace": "pre-wrap"}),
+
+    dcc.Interval(id="tick-hist", interval=HIST_REFRESH_SECONDS * 1000, n_intervals=0),
+])
 
 app.layout = html.Div(
     style={"fontFamily": "Arial", "maxWidth": "1100px", "margin": "24px auto"},
     children=[
         html.H1("Dashboard Crypto (CoinGecko + Dash)"),
 
-        # ✅ Descripción del dashboard
         html.Details(
             open=False,
             children=[
@@ -104,88 +147,25 @@ app.layout = html.Div(
             },
         ),
 
-        dcc.Tabs(id="tabs", value="tab-1", children=[
-            dcc.Tab(label="Precio actual", value="tab-1"),
-            dcc.Tab(label="Histórico", value="tab-2"),
+        dcc.Tabs(children=[
+            dcc.Tab(label="Precio actual", children=tab1_layout),
+            dcc.Tab(label="Histórico", children=tab2_layout),
         ]),
-
-        html.Div(id="contenido")
-    ]
+    ],
 )
 
-
-# ---------- Layouts ----------
-def layout_tab1():
-    return html.Div([
-        html.H3("Precio actual (USD)"),
-
-        dcc.Dropdown(
-            id="coin-dropdown",
-            options=COINS,
-            value="bitcoin",
-            clearable=False,
-            style={"width": "300px"}
-        ),
-
-        html.H2(id="precio", style={"marginTop": "12px"}),
-
-        html.Div("Siguiente actualización en:"),
-        html.H2(id="countdown"),
-
-        dcc.Interval(id="tick-1s", interval=1000, n_intervals=0),
-        dcc.Interval(id="tick-60s", interval=REFRESH_SECONDS * 1000, n_intervals=0),
-    ])
-
-
-def layout_tab2():
-    return html.Div([
-        html.H3("Histórico de precio"),
-
-        html.Div([
-            html.Div([
-                html.Label("Moneda"),
-                dcc.Dropdown(
-                    id="coin-hist",
-                    options=COINS,
-                    value="bitcoin",
-                    clearable=False,
-                    style={"width": "250px"}
-                ),
-            ]),
-            html.Div([
-                html.Label("Periodo"),
-                dcc.Dropdown(
-                    id="days",
-                    options=DAYS_OPTIONS,
-                    value=7,
-                    clearable=False,
-                    style={"width": "150px"}
-                ),
-            ]),
-        ], style={"display": "flex", "gap": "20px"}),
-
-        dcc.Graph(id="hist-graph"),
-        dcc.Interval(id="tick-hist", interval=HIST_REFRESH_SECONDS * 1000, n_intervals=0),
-    ])
-
-
-@app.callback(Output("contenido", "children"), Input("tabs", "value"))
-def render_tab(tab):
-    return layout_tab1() if tab == "tab-1" else layout_tab2()
-
-
-# ---------- Precio actual ----------
+# ---------- Callbacks Tab 1 ----------
 @app.callback(
     Output("precio", "children"),
+    Output("error-precio", "children"),
     Input("tick-60s", "n_intervals"),
     Input("coin-dropdown", "value"),
 )
 def actualizar_precio(_, coin):
-    precio = obtener_precio_crypto(coin)
+    precio, err = obtener_precio_crypto(coin)
     if precio is None:
-        return "No se pudo obtener el precio"
-    return f"{coin.upper()} = ${precio:,.2f}"
-
+        return "—", err or "No se pudo obtener el precio"
+    return f"{coin.upper()} = ${precio:,.2f}", ""
 
 @app.callback(
     Output("countdown", "children"),
@@ -196,29 +176,35 @@ def actualizar_countdown(ticks):
     remaining = REFRESH_SECONDS - elapsed
     return f"{remaining}s"
 
-
-# ---------- Histórico ----------
+# ---------- Callbacks Tab 2 ----------
 @app.callback(
     Output("hist-graph", "figure"),
+    Output("error-hist", "children"),
     Input("coin-hist", "value"),
     Input("days", "value"),
     Input("tick-hist", "n_intervals"),
 )
 def actualizar_historico(coin, days, _):
     fig = go.Figure()
-    hist = obtener_historico(coin, days)
+    res, err = obtener_historico(coin, int(days))
 
-    if hist:
-        x, y = hist
-        fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=coin.upper()))
+    if res is None:
+        fig.update_layout(
+            title=f"{coin.upper()} - últimos {days} días",
+            xaxis_title="Tiempo",
+            yaxis_title="Precio USD"
+        )
+        return fig, err or "No se pudo cargar histórico"
 
+    x, y = res
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=coin.upper()))
     fig.update_layout(
         title=f"{coin.upper()} - últimos {days} días",
-        xaxis_title="Tiempo",
+        xaxis_title="Tiempo (UTC)",
         yaxis_title="Precio USD"
     )
-    return fig
-
+    return fig, ""
 
 if __name__ == "__main__":
     app.run(debug=True)
+
