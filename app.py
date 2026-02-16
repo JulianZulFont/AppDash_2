@@ -1,19 +1,24 @@
+import time
 import requests
 from datetime import datetime, timezone
 
 from dash import Dash, html, dcc, Input, Output
 import plotly.graph_objects as go
 
-# ---------- Config ----------
-REFRESH_SECONDS = 60
-HIST_REFRESH_SECONDS = 300
+
+REFRESH_SECONDS = 60          # precio actual
+HIST_REFRESH_SECONDS = 300    # histórico (cada 5 min)
+
+
+BINANCE_BASE = "https://data-api.binance.vision"  # :contentReference[oaicite:3]{index=3}
+
 
 COINS = [
-    {"label": "Bitcoin (BTC)", "value": "bitcoin"},
-    {"label": "Ethereum (ETH)", "value": "ethereum"},
-    {"label": "Solana (SOL)", "value": "solana"},
-    {"label": "Dogecoin (DOGE)", "value": "dogecoin"},
-    {"label": "Cardano (ADA)", "value": "cardano"},
+    {"label": "Bitcoin (BTC)", "value": "BTCUSDT"},
+    {"label": "Ethereum (ETH)", "value": "ETHUSDT"},
+    {"label": "Solana (SOL)", "value": "SOLUSDT"},
+    {"label": "Dogecoin (DOGE)", "value": "DOGEUSDT"},
+    {"label": "Cardano (ADA)", "value": "ADAUSDT"},
 ]
 
 DAYS_OPTIONS = [
@@ -23,88 +28,134 @@ DAYS_OPTIONS = [
 ]
 
 DASHBOARD_DESC = """
+
+
 Este dashboard fue desarrollado con Python utilizando Dash para visualizar información financiera en tiempo casi real
-desde la API pública de CoinGecko. En el primer tablero se muestra el precio actual de una criptomoneda seleccionada,
-con actualización automática y un contador regresivo. En el segundo tablero se presenta el histórico del precio para
+desde una API pública. En el primer tablero se muestra el precio actual de una criptomoneda seleccionada, con
+actualización automática y un contador regresivo. En el segundo tablero se presenta el histórico del precio para
 analizar tendencias en distintas ventanas de tiempo. Técnicamente, el proyecto integra consumo de APIs externas,
 procesamiento de JSON y actualización reactiva de componentes mediante callbacks.
 """
 
-# ---------- CoinGecko API (con User-Agent + error visible) ----------
 HEADERS = {
     "Accept": "application/json",
-    "User-Agent": "dash-coingecko-demo/1.0"
+    "User-Agent": "dash-binance-demo/1.0"
 }
 
-def obtener_precio_crypto(coin_id):
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": coin_id, "vs_currencies": "usd"}
+_price_cache = {}   # symbol -> {"ts": float, "price": float}
+_klines_cache = {}  # (symbol, days) -> {"ts": float, "data": (xs, ys)}
 
-    r = requests.get(url, params=params, headers=HEADERS, timeout=20)
-    # Si CoinGecko devuelve 403/429, lo mostramos
-    if r.status_code != 200:
-        return None, f"CoinGecko HTTP {r.status_code}: {r.text[:200]}"
+def _now():
+    return time.time()
 
-    data = r.json()
+def get_price(symbol: str, ttl: int = 20):
+    c = _price_cache.get(symbol)
+    if c and (_now() - c["ts"] < ttl):
+        return c["price"], ""
+
+    url = f"{BINANCE_BASE}/api/v3/ticker/price"
+    params = {"symbol": symbol}
     try:
-        return float(data[coin_id]["usd"]), ""
-    except Exception:
-        return None, "Respuesta JSON inesperada"
+        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        if r.status_code != 200:
+            return None, f"Binance HTTP {r.status_code}: {r.text[:200]}"
+        data = r.json()
+        price = float(data["price"])
+        _price_cache[symbol] = {"ts": _now(), "price": price}
+        return price, ""
+    except Exception as e:
 
-def obtener_historico(coin_id, days):
-    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
-    params = {"vs_currency": "usd", "days": days}
+        if c:
+            return c["price"], f"Error consultando Binance ({type(e).__name__}). Mostrando último valor."
+        return None, f"Error consultando Binance ({type(e).__name__})."
 
-    r = requests.get(url, params=params, headers=HEADERS, timeout=25)
-    if r.status_code != 200:
-        return None, f"CoinGecko HTTP {r.status_code}: {r.text[:200]}"
+def get_klines(symbol: str, days: int, ttl: int = 120):
+    """
+    Klines: /api/v3/klines
+    Para 1d y 7d usamos 1h. Para 30d usamos 4h (reduce puntos).
+    """
+    key = (symbol, days)
+    c = _klines_cache.get(key)
+    if c and (_now() - c["ts"] < ttl):
+        return c["data"], ""
 
-    data = r.json()
-    prices = data.get("prices", [])
-    if not prices:
-        return None, "Sin datos en 'prices'"
+    if days <= 7:
+        interval = "1h"
+        limit = min(1000, days * 24)      # 24 pts por día
+    else:
+        interval = "4h"
+        limit = min(1000, days * 6)       # 6 pts por día
 
-    xs = [datetime.fromtimestamp(p[0] / 1000, tz=timezone.utc) for p in prices]
-    ys = [float(p[1]) for p in prices]
-    return (xs, ys), ""
+    url = f"{BINANCE_BASE}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
 
-# ---------- Dash ----------
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=25)
+        if r.status_code != 200:
+            return None, f"Binance HTTP {r.status_code}: {r.text[:200]}"
+
+        klines = r.json()
+        if not klines:
+            return None, "Sin datos de klines."
+
+        # kline format:
+        # [
+        #   [
+        #     0 Open time (ms),
+        #     1 Open,
+        #     2 High,
+        #     3 Low,
+        #     4 Close,
+        #     5 Volume,
+        #     ...
+        #   ],
+        #   ...
+        # ]
+        xs = [datetime.fromtimestamp(k[0] / 1000, tz=timezone.utc) for k in klines]
+        ys = [float(k[4]) for k in klines]  # Close
+
+        _klines_cache[key] = {"ts": _now(), "data": (xs, ys)}
+        return (xs, ys), ""
+    except Exception as e:
+        if c:
+            return c["data"], f"Error consultando klines ({type(e).__name__}). Mostrando cache."
+        return None, f"Error consultando klines ({type(e).__name__})."
+
+
 app = Dash(__name__)
-server = app.server  # para Render + gunicorn
+server = app.server  # necesario para gunicorn en Render
 
 tab1_layout = html.Div([
-    html.H3("Precio actual (USD)"),
+    html.H3("Precio actual (USDT)"),
 
     dcc.Dropdown(
-        id="coin-dropdown",
+        id="symbol-dropdown",
         options=COINS,
-        value="bitcoin",
+        value="BTCUSDT",
         clearable=False,
-        style={"width": "300px"}
+        style={"width": "320px"}
     ),
 
     html.H2(id="precio", style={"marginTop": "12px"}),
-
     html.Div("Siguiente actualización en:"),
     html.H2(id="countdown", style={"marginTop": "6px"}),
 
     html.Pre(id="error-precio", style={"color": "crimson", "whiteSpace": "pre-wrap"}),
 
-    # Intervalos SIEMPRE presentes (no dinámicos)
     dcc.Interval(id="tick-1s", interval=1000, n_intervals=0),
-    dcc.Interval(id="tick-60s", interval=REFRESH_SECONDS * 1000, n_intervals=0),
+    dcc.Interval(id="tick-price", interval=REFRESH_SECONDS * 1000, n_intervals=0),
 ])
 
 tab2_layout = html.Div([
-    html.H3("Histórico de precio"),
+    html.H3("Histórico (Close)"),
 
     html.Div([
         html.Div([
-            html.Label("Moneda"),
+            html.Label("Par (USDT)"),
             dcc.Dropdown(
-                id="coin-hist",
+                id="symbol-hist",
                 options=COINS,
-                value="bitcoin",
+                value="BTCUSDT",
                 clearable=False,
                 style={"width": "250px"}
             ),
@@ -130,7 +181,7 @@ tab2_layout = html.Div([
 app.layout = html.Div(
     style={"fontFamily": "Arial", "maxWidth": "1100px", "margin": "24px auto"},
     children=[
-        html.H1("Dashboard Crypto (CoinGecko + Dash)"),
+        html.H1("Dashboard Crypto (Binance + Dash)"),
 
         html.Details(
             open=False,
@@ -154,18 +205,18 @@ app.layout = html.Div(
     ],
 )
 
-# ---------- Callbacks Tab 1 ----------
+
 @app.callback(
     Output("precio", "children"),
     Output("error-precio", "children"),
-    Input("tick-60s", "n_intervals"),
-    Input("coin-dropdown", "value"),
+    Input("tick-price", "n_intervals"),
+    Input("symbol-dropdown", "value"),
 )
-def actualizar_precio(_, coin):
-    precio, err = obtener_precio_crypto(coin)
-    if precio is None:
-        return "—", err or "No se pudo obtener el precio"
-    return f"{coin.upper()} = ${precio:,.2f}", ""
+def actualizar_precio(_, symbol):
+    price, err = get_price(symbol)
+    if price is None:
+        return "—", err
+    return f"{symbol} = {price:,.6f} USDT", err
 
 @app.callback(
     Output("countdown", "children"),
@@ -176,35 +227,33 @@ def actualizar_countdown(ticks):
     remaining = REFRESH_SECONDS - elapsed
     return f"{remaining}s"
 
-# ---------- Callbacks Tab 2 ----------
 @app.callback(
     Output("hist-graph", "figure"),
     Output("error-hist", "children"),
-    Input("coin-hist", "value"),
+    Input("symbol-hist", "value"),
     Input("days", "value"),
     Input("tick-hist", "n_intervals"),
 )
-def actualizar_historico(coin, days, _):
+def actualizar_historico(symbol, days, _):
     fig = go.Figure()
-    res, err = obtener_historico(coin, int(days))
+    data, err = get_klines(symbol, int(days))
 
-    if res is None:
+    if data is None:
         fig.update_layout(
-            title=f"{coin.upper()} - últimos {days} días",
+            title=f"{symbol} - últimos {days} días",
             xaxis_title="Tiempo",
-            yaxis_title="Precio USD"
+            yaxis_title="Close (USDT)"
         )
-        return fig, err or "No se pudo cargar histórico"
+        return fig, err
 
-    x, y = res
-    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=coin.upper()))
+    x, y = data
+    fig.add_trace(go.Scatter(x=x, y=y, mode="lines", name=symbol))
     fig.update_layout(
-        title=f"{coin.upper()} - últimos {days} días",
+        title=f"{symbol} - últimos {days} días",
         xaxis_title="Tiempo (UTC)",
-        yaxis_title="Precio USD"
+        yaxis_title="Close (USDT)"
     )
-    return fig, ""
+    return fig, err
 
 if __name__ == "__main__":
     app.run(debug=True)
-
